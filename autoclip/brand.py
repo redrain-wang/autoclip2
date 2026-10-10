@@ -1,13 +1,14 @@
 """账号品牌：台标/水印图、头像、成片封面。"""
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import tempfile
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageStat
 
 RED, ORANGE, YELLOW = (255, 45, 85), (255, 149, 0), (255, 222, 0)
 
@@ -34,51 +35,103 @@ def _gradient(w: int, h: int, c1: tuple, c2: tuple) -> Image.Image:
     return Image.composite(Image.new("RGB", (w, h), c2), Image.new("RGB", (w, h), c1), g)
 
 
+def _heart(cx: float, cy: float, r: float, n: int = 200) -> list[tuple[float, float]]:
+    pts = []
+    for i in range(n):
+        t = 2 * math.pi * i / n
+        x = 16 * math.sin(t) ** 3
+        y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        pts.append((cx + x * r / 17, cy - (y + 2.5) * r / 17))
+    return pts
+
+
 def _badge(d: int) -> Image.Image:
-    """圆形渐变底 + 白色播放三角。"""
+    """圆角方形渐变底 + 白色爱心 + 渐变播放键（爱 + 片）。"""
     s = d * 4
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    grad = _gradient(s, s, RED, ORANGE)
     mask = Image.new("L", (s, s), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, s - 1, s - 1), fill=255)
-    img.paste(_gradient(s, s, RED, ORANGE), (0, 0), mask)
-    ImageDraw.Draw(img).polygon([(s * 0.38, s * 0.27), (s * 0.38, s * 0.73), (s * 0.76, s * 0.5)], fill="white")
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, s - 1, s - 1), radius=int(s * 0.26), fill=255)
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    img.paste(grad, (0, 0), mask)
+    gloss = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(gloss).ellipse((-s * 0.3, -s * 0.75, s * 1.3, s * 0.42), fill=46)
+    img.alpha_composite(Image.merge("RGBA", (*Image.new("RGB", (s, s), "white").split(),
+                                             ImageChops.darker(gloss, mask))))
+    heart = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(heart).polygon(_heart(s * 0.5, s * 0.52, s * 0.34), fill=255)
+    img.paste(Image.new("RGB", (s, s), "white"), (0, 0), heart)
+    tri = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(tri).polygon([(s * 0.43, s * 0.37), (s * 0.43, s * 0.61), (s * 0.63, s * 0.49)], fill=255)
+    img.paste(grad, (0, 0), tri)
     return img.resize((d, d), Image.LANCZOS)
 
 
-def make_logo(path: Path, name: str, family: str = "PingFang SC") -> Path:
-    """透明底横版水印：圆形播放徽标 + 描边文字。"""
-    h = 160
-    font = _font(int(h * 0.62), family)
-    tw = int(font.getlength(name))
-    pad, gap, stroke = 16, 22, 7
-    w = pad * 2 + h + gap + tw + stroke * 2
-    img = Image.new("RGBA", (w, h + pad * 2), (0, 0, 0, 0))
-    img.alpha_composite(_badge(h), (pad, pad))
-    text = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    y = pad + h // 2
-    ImageDraw.Draw(text).text((pad + h + gap + stroke, y), name, font=font, fill="white", anchor="lm",
-                              stroke_width=stroke, stroke_fill=(0, 0, 0, 200))
-    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    shadow.putalpha(text.getchannel("A").point(lambda a: a * 0.5).filter(ImageFilter.GaussianBlur(6)))
-    img.alpha_composite(shadow, (3, 4))
-    img.alpha_composite(text)
+def make_logo(path: Path, name: str, family: str = "PingFang SC", slogan: str = "AI DA PIAN ER") -> Path:
+    """透明底横版水印：徽标 | 渐变首字的账号名 + 字母间距拉开的副标。"""
+    k = 3  # 超采样
+    h = 150 * k
+    big, small = _font(int(h * 0.56), family), _font(int(h * 0.15), family, "semibold")
+    spacing = int(h * 0.06)
+    slogan_w = sum(small.getlength(c) for c in slogan) + spacing * (len(slogan) - 1)
+    pad, gap = 18 * k, int(h * 0.16)
+    name_w = big.getlength(name)
+    tx = pad + h + gap + int(h * 0.05) + gap
+    w = int(tx + max(name_w, slogan_w) + pad)
+    H = h + pad * 2
+
+    layer = Image.new("RGBA", (w, H), (0, 0, 0, 0))
+    layer.alpha_composite(_badge(h), (pad, pad))
+    d = ImageDraw.Draw(layer)
+    # 竖向分隔线
+    lx = pad + h + gap
+    d.rounded_rectangle((lx, pad + h * 0.16, lx + int(h * 0.025), pad + h * 0.84), radius=k * 2, fill=(255, 255, 255, 170))
+
+    text = Image.new("L", (w, H), 0)
+    ty = pad + int(h * 0.36)
+    bold = int(h * 0.014)  # 苹方最粗只到 Semibold，用同色描边加粗
+    ImageDraw.Draw(text).text((tx, ty), name, font=big, fill=255, anchor="lm", stroke_width=bold, stroke_fill=255)
+    first = Image.new("L", (w, H), 0)
+    ImageDraw.Draw(first).text((tx, ty), name[:1], font=big, fill=255, anchor="lm", stroke_width=bold, stroke_fill=255)
+    white = Image.new("RGBA", (w, H), (255, 255, 255, 0))
+    white.putalpha(text)
+    colored = _gradient(w, H, YELLOW, ORANGE).convert("RGBA")
+    colored.putalpha(first)
+
+    sub = Image.new("L", (w, H), 0)
+    x, sy = tx + 2 * k, pad + int(h * 0.84)
+    sd = ImageDraw.Draw(sub)
+    for c in slogan:
+        sd.text((x, sy), c, font=small, fill=225, anchor="lm")
+        x += small.getlength(c) + spacing
+
+    alpha = ImageChops.lighter(ImageChops.lighter(text, sub), layer.getchannel("A"))
+    shadow = Image.new("RGBA", (w, H), (0, 0, 0, 0))
+    shadow.putalpha(alpha.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(5 * k)).point(lambda v: v * 0.7))
+    out = Image.new("RGBA", (w, H), (0, 0, 0, 0))
+    out.alpha_composite(shadow, (k * 2, k * 3))
+    out.alpha_composite(layer)
+    out.alpha_composite(white)
+    out.alpha_composite(colored)
+    subl = Image.new("RGBA", (w, H), (255, 255, 255, 0))
+    subl.putalpha(sub)
+    out.alpha_composite(subl)
+    out = out.resize((w // k, H // k), Image.LANCZOS)
     path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(path)
+    out.save(path)
     return path
 
 
 def make_avatar(path: Path, name: str, size: int = 1024, family: str = "PingFang SC") -> Path:
-    """方形头像/台标：渐变底 + 播放徽标 + 账号名。"""
-    img = _gradient(size, size, RED, ORANGE).convert("RGBA")
-    d = int(size * 0.36)
-    ring = Image.new("RGBA", (d, d), (0, 0, 0, 0))
-    ImageDraw.Draw(ring).ellipse((0, 0, d - 1, d - 1), fill="white")
-    tri = [(d * 0.38, d * 0.27), (d * 0.38, d * 0.73), (d * 0.76, d * 0.5)]
-    ImageDraw.Draw(ring).polygon(tri, fill=RED)
-    img.alpha_composite(ring, ((size - d) // 2, int(size * 0.14)))
-    font = _font(int(size * 0.2), family)
-    ImageDraw.Draw(img).text((size // 2, int(size * 0.76)), name, font=font, fill="white", anchor="mm",
-                             stroke_width=int(size * 0.008), stroke_fill=(150, 0, 30))
+    """方形头像/台标：深色底 + 大徽标 + 账号名。"""
+    img = Image.new("RGBA", (size, size), (24, 18, 28, 255))
+    glow = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(glow).ellipse((size * 0.1, size * 0.02, size * 0.9, size * 0.82), fill=120)
+    img.paste(_gradient(size, size, RED, ORANGE), (0, 0), glow.filter(ImageFilter.GaussianBlur(size // 8)))
+    d = int(size * 0.46)
+    img.alpha_composite(_badge(d), ((size - d) // 2, int(size * 0.13)))
+    font = _font(int(size * 0.17), family)
+    ImageDraw.Draw(img).text((size // 2, int(size * 0.79)), name, font=font, fill="white", anchor="mm",
+                             stroke_width=int(size * 0.004), stroke_fill="white")
     path.parent.mkdir(parents=True, exist_ok=True)
     img.convert("RGB").save(path, quality=95)
     return path

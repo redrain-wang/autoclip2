@@ -48,6 +48,7 @@ class TTSConfig:
     base_url: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     max_concurrency: int = 4
+    pronounce: dict = field(default_factory=dict)  # 仅用于配音的替换，纠正多音字（字幕不变）
 
 
 @dataclass

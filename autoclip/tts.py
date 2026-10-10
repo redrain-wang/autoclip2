@@ -32,6 +32,8 @@ def synthesize(script: dict, out_dir: Path, s: Settings) -> dict[int, dict]:
     t = s.tts
 
     def one(i: int, text: str) -> tuple[int, dict]:
+        for k, v in t.pronounce.items():
+            text = text.replace(k, v)
         p, meta = out_dir / f"n{i:03d}.mp3", out_dir / f"n{i:03d}.json"
         h = short_hash([text, t.backend, t.voice, t.rate, t.pitch, t.model, t.instructions])
         if p.exists() and meta.exists() and read_json(meta).get("hash") == h:

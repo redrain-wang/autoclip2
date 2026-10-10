@@ -2,18 +2,41 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import brand
 from .config import Job, RenderConfig, Settings, render_cfg
-from .utils import log, run, short_hash, slug, subs_in, write_json
+from .utils import file_key, log, read_json, run, short_hash, slug, subs_in, write_json
 
 NARR_PAD = 0.35  # 配音前后留白
 NARR_DELAY = 0.15
 
 
-def build_timeline(script: dict, voices: dict[int, dict], ingests: list[dict]) -> list[dict]:
+def black_ranges(file: str, cache: Path) -> list[list[float]]:
+    """黑场（含黑底白字的集数卡）区间，解说画面要避开。"""
+    if cache.exists():
+        return read_json(cache)
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-i", file, "-an", "-vf",
+                        "scale=320:-2,blackdetect=d=0.3:pix_th=0.05:pic_th=0.95", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    out = [[float(a), float(b)] for a, b in re.findall(r"black_start:([\d.]+) black_end:([\d.]+)", p.stderr)]
+    write_json(cache, out)
+    return out
+
+
+def _skip_black(st: float, dur: float, black: list[list[float]], limit: float) -> float:
+    for _ in range(len(black)):
+        hit = next((b for b in black if st < b[1] and st + dur > b[0]), None)
+        if not hit or hit[1] + 0.1 + dur > limit:
+            break
+        st = hit[1] + 0.1
+    return st
+
+
+def build_timeline(script: dict, voices: dict[int, dict], ingests: list[dict],
+                   blacks: list[list[list[float]]] | None = None) -> list[dict]:
     items, t, prev = [], 0.0, None
     for i, seg in enumerate(script["segments"]):
         ing = ingests[seg["ep"]]
@@ -26,6 +49,8 @@ def build_timeline(script: dict, voices: dict[int, dict], ingests: list[dict]) -
             if prev and prev["beat_id"] == seg["beat_id"] and st < prev["src_end"] - 0.5:
                 st = prev["src_end"]
             st = max(0.0, min(st, ing["duration"] - dur - 0.1))
+            if blacks:
+                st = _skip_black(st, dur, blacks[seg["ep"]], ing["duration"] - 0.1)
             item.update(audio=v["path"], audio_hash=v["hash"], tts_dur=v["duration"], text=seg["text"])
         else:
             dur = seg["src_end"] - st
@@ -169,7 +194,9 @@ def render(job: Job, script: dict, voices: dict[int, dict], ingests: list[dict],
     W, H = (1080, 1920) if r.layout == "vertical" else (1920, 1080)
     src_w, src_h = ingests[0]["width"] or 16, ingests[0]["height"] or 9
     fg_h = min(H, round(W * src_h / src_w / 2) * 2)
-    items = build_timeline(script, voices, ingests)
+    items = build_timeline(script, voices, ingests,
+                           [black_ranges(i["file"], s.workdir / "media" / file_key(Path(i["file"])) / "black.json")
+                            for i in ingests])
 
     seg_files = []
     for i, it in enumerate(items):
@@ -199,7 +226,7 @@ def render(job: Job, script: dict, voices: dict[int, dict], ingests: list[dict],
     fc = "[0:v]ass=subs.ass[v]"
     if logo:
         vertical = r.layout == "vertical"
-        lw = round(W * (0.26 if vertical else 0.14) / 2) * 2
+        lw = round(W * (0.30 if vertical else 0.16) / 2) * 2
         y = (H - fg_h) // 2 + 24 if vertical else 36
         cmd += ["-i", str(logo)]
         fc = (f"[0:v]ass=subs.ass[s];[1:v]scale={lw}:-1,format=rgba,colorchannelmixer=aa={r.watermark_opacity}[wm];"

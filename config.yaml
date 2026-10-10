@@ -48,6 +48,15 @@ tts:
   voice: zh-CN-YunjianNeural     # 试听样本见 work/voice_test/；其他：zh-CN-YunxiNeural / zh-CN-YunyangNeural
   rate: "+20%"
   pitch: "+0Hz"
+  pronounce:                     # 只替换配音文本，纠正多音字；字幕仍显示原文
+    乡长: 乡掌
+    县长: 县掌
+    镇长: 镇掌
+    村长: 村掌
+    厂长: 厂掌
+    所长: 所掌
+    队长: 队掌
+    校长: 校掌
 
 analysis:
   scene_threshold: 0.3
@@ -78,7 +87,7 @@ presets:
     mode: per_episode
     layout: vertical
     target_duration: 240
-    narration_ratio: 0.75
+    narration_ratio: 0.6     # 解说占 60%，原声 40%
     narration_speed: 5.0
     count: auto     # 也可写固定数字；auto 时上限由 max_count 控制（默认 6）
   bili:             # B站/西瓜：每集一条，横屏 5 分钟

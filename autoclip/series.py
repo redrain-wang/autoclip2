@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import yaml
@@ -72,9 +73,11 @@ def apply_name_fixes(ingests: list[dict], fixes: dict[str, str]) -> None:
 
 
 def bible_text(bible: dict, eps: list[int]) -> str:
+    # 识别错字不是真别称，给模型看会把“牛头”之类普通词当成人名
+    typos = set(bible.get("asr_fixes") or {})
     chars = "\n".join(
         f"- {c.get('name')}：{c.get('identity', '')}；关系：{c.get('relations', '')}；"
-        f"别称：{'、'.join(c.get('aliases') or []) or '无'}；{c.get('traits', '')}"
+        f"别称：{'、'.join(a for a in c.get('aliases') or [] if a not in typos) or '无'}；{c.get('traits', '')}"
         for c in bible.get("characters") or [])
     near = {e + d for e in eps for d in (-1, 0, 1)}
     syn = "\n".join(f"第{e.get('ep')}集：{e.get('synopsis', '')}"
@@ -96,25 +99,51 @@ def analyze_episode(ing: dict, beats: list[dict], bible: dict, ep: int, llm: LLM
         data = cached(path.with_name(path.stem + "_scenes.json"), scenes)
         log.info("[episode] 第 %d 集：标注说话人（%d 场）", ep, len(data["scenes"]))
         with ThreadPoolExecutor(llm.cfg.max_concurrency) as ex:
-            parts = list(ex.map(lambda sc: _speakers(sc, subs, bible, llm), data["scenes"]))
-        return {**data, "speakers": [x for p in parts for x in p]}
+            parts = list(ex.map(lambda k: _speakers(data["scenes"], k, subs, beats, bible, llm),
+                                range(len(data["scenes"]))))
+        return {**data, "speakers": [x for p, _ in parts for x in p],
+                "fixes": {k: v for _, f in parts for k, v in f.items()}}
     return cached(path, work)
 
 
-def _speakers(sc: dict, subs: list[dict], bible: dict, llm: LLMClient) -> list[str]:
+def _speakers(scenes: list[dict], k: int, subs: list[dict], beats: list[dict], bible: dict,
+              llm: LLMClient) -> tuple[list[str], dict[str, str]]:
+    sc = scenes[k]
     n = sc["l1"] - sc["l0"] + 1
     if n <= 0:
-        return []
+        return [], {}
     chars = "\n".join(f"- {c.get('name')}：{c.get('identity', '')}；{c.get('relations', '')}" for c in bible.get("characters") or [])
-    lines = "\n".join(f"{k + 1}. {subs[i]['text']}" for k, i in enumerate(range(sc["l0"], sc["l1"] + 1)))
-    user = (f"【人物表】\n{chars}\n\n【本场】{sc.get('place', '')}，在场：{'、'.join(sc.get('people') or [])}\n"
-            f"剧情：{sc.get('summary', '')}\n\n【台词（共 {n} 行）】\n{lines}")
+    lines = "\n".join(f"{j + 1}. {subs[i]['text']}" for j, i in enumerate(range(sc["l0"], sc["l1"] + 1)))
+    vis = "\n".join(f"[{mmss(b['start'])}] {b['summary']}" for b in beats
+                    if b["end"] > sc["t0"] and b["start"] < sc["t1"] and b.get("summary")) or "无"
+    prev = scenes[k - 1] if k else None
+    prev_txt = f"{'、'.join(prev.get('people') or [])}：{prev.get('summary', '')}" if prev else "无"
+    user = (f"【人物表】\n{chars}\n\n【上一场】{prev_txt}\n\n【本场】{sc.get('place', '')}，初步判断在场："
+            f"{'、'.join(sc.get('people') or [])}\n剧情：{sc.get('summary', '')}\n画面：\n{vis}\n\n"
+            f"【台词（共 {n} 行）】\n{lines}")
     try:
-        out = [str(x) for x in llm.chat_json(prompts.SPEAKER_SYSTEM, user, temperature=0.1).get("speakers") or []]
+        r = llm.chat_json(prompts.SPEAKER_SYSTEM, user, temperature=0.1)
     except Exception as e:  # noqa: BLE001  单场失败只丢说话人，不阻塞
         log.warning("[episode] %s 说话人标注失败: %s", sc["id"], e)
-        out = []
-    return ["" if x == "?" else x for x in (out + [""] * n)[:n]]
+        r = {}
+    out = [str(x) for x in r.get("speakers") or []]
+    raw = r.get("fixes") if isinstance(r.get("fixes"), dict) else {}
+    fixes = {}
+    for k, v in raw.items():
+        try:
+            i = sc["l0"] + int(str(k).lstrip("L")) - 1
+        except ValueError:
+            continue
+        old, new = subs[i]["text"] if sc["l0"] <= i <= sc["l1"] else "", str(v).strip()
+        # 只接受小幅修正，防止模型改写台词
+        if old and new and new != old and SequenceMatcher(None, old, new).ratio() >= 0.6:
+            fixes[str(i)] = new
+    return ["" if x == "?" else x for x in (out + [""] * n)[:n]], fixes
+
+
+def apply_text_fixes(ing: dict, epi: dict) -> None:
+    for k, v in (epi.get("fixes") or {}).items():
+        ing["subs"][int(k)]["text"] = v
 
 
 def _clean_episode(r: dict, ing: dict) -> dict:

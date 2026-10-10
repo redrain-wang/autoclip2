@@ -8,7 +8,9 @@ from .series import bible_text, line_text, mmss
 from .utils import log
 
 HOOK_MAX = 12.0
-ORIG_MAX = 18.0
+ORIG_MAX = 25.0
+TURN_GAP = 0.8   # 同一人两句间隔小于此视为一口气说完，不在中间切
+TURN_EXTRA = 8.0 # 为说完一口气允许超出上限的秒数
 
 
 def _scene_header(sc: dict) -> str:
@@ -69,12 +71,44 @@ def original_seg(doc: dict, a: int, b: int, max_len: float = ORIG_MAX) -> dict |
         return None
     while b > a and L[b]["end"] - L[a]["start"] > max_len:
         b -= 1
+    while (b + 1 < len(L) and L[b + 1]["ep"] == L[b]["ep"] and L[b]["spk"] and L[b + 1]["spk"] == L[b]["spk"]
+           and L[b + 1]["start"] - L[b]["end"] < TURN_GAP and L[b + 1]["end"] - L[a]["start"] <= max_len + TURN_EXTRA):
+        b += 1
     st = max(0.0, L[a]["start"] - 0.1)
     en = L[b]["end"] + 0.3
     if b + 1 < len(L) and L[b + 1]["ep"] == L[b]["ep"]:
-        en = min(en, max(L[b]["end"], L[b + 1]["start"]))
+        # 识别的起始时间常偏晚，提前收尾避免带出下一句的开头
+        en = min(en, max(L[b]["end"], L[b + 1]["start"] - 0.25))
     return {"type": "original", "beat_id": _scene_of(doc, a), "ep": L[a]["ep"], "src_start": round(st, 2),
             "src_end": round(en, 2), "quote": " / ".join(f"{L[i]['spk'] or '?'}：{L[i]['text']}" for i in range(a, b + 1))}
+
+
+def _review(bible: dict, job: Job, scene_txt: str, segs: list[dict], llm: LLMClient) -> list[dict]:
+    """事实核查：对照台词删改编造、张冠李戴的解说。"""
+    narr = [i for i, x in enumerate(segs) if x["type"] == "narration"]
+    draft = "\n".join(f"{n}. " + (f"【解说】{x['text']}" if x["type"] == "narration" else f"【原声】{x['quote']}")
+                      for n, x in enumerate(segs, 1))
+    user = f"{bible_text(bible, job.episodes)}\n\n【场次与台词】\n{scene_txt}\n\n【解说稿】\n{draft}"
+    try:
+        r = llm.chat_json(prompts.REVIEW_SYSTEM, user, temperature=0.2)
+    except Exception as e:  # noqa: BLE001  核查失败不阻塞出片
+        log.warning("[review] 核查失败，保留原稿: %s", e)
+        return segs
+    drop = set()
+    for f in r.get("fixes") or []:
+        try:
+            i = int(f["n"]) - 1
+        except (KeyError, TypeError, ValueError):
+            continue
+        if i not in narr:
+            continue
+        text = str(f.get("text") or "").strip()
+        log.info("[review] #%d %s：%s → %s", i + 1, f.get("problem", ""), segs[i]["text"], text or "（删除）")
+        if text:
+            segs[i] = {**segs[i], "text": text}
+        else:
+            drop.add(i)
+    return [x for i, x in enumerate(segs) if i not in drop]
 
 
 def write_script(job: Job, bible: dict, doc: dict, video: dict, llm: LLMClient, s: Settings) -> dict:
@@ -87,10 +121,10 @@ def write_script(job: Job, bible: dict, doc: dict, video: dict, llm: LLMClient, 
     hook = video.get("hook")
     hook_txt = "\n".join(line_text(doc, i) for i in range(hook[0], hook[1] + 1)) if hook else "（无，直接从解说开始）"
     by_id = {sc["id"]: sc for sc in doc["scenes"]}
+    scene_txt = "\n\n".join(_scene_block(doc, by_id[x]) for x in video["scenes"])
     user = (f"{bible_text(bible, job.episodes)}\n\n【本集剧情】\n{doc['synopsis']}\n\n"
             f"【本条标题】{video['title']}\n【看点】{video['angle']}\n\n【钩子（已在开场播放）】\n{hook_txt}\n\n"
-            "【选定的场戏（按时间顺序，行首为说话人）】\n\n"
-            + "\n\n".join(_scene_block(doc, by_id[x]) for x in video["scenes"]))
+            "【选定的场戏（按时间顺序，行首为说话人）】\n\n" + scene_txt)
     log.info("[script] 生成解说稿")
     r = llm.chat_json(system, user, temperature=0.8)
 
@@ -110,6 +144,7 @@ def write_script(job: Job, bible: dict, doc: dict, video: dict, llm: LLMClient, 
                              "src_start": round(max(0.0, x["start"] - 0.3), 2), "text": str(seg["text"]).strip()})
         except (KeyError, TypeError, ValueError):
             continue
+    segs = _review(bible, job, scene_txt, segs, llm)
     if not any(x["type"] == "narration" for x in segs):
         raise RuntimeError("解说稿为空")
     return {"title": r.get("title") or video["title"], "description": r.get("description", ""),

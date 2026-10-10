@@ -118,6 +118,7 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
         with _media_lock(f"episode:{key}"):
             analyses.append(series.analyze_episode(ing, beats, bible, no, ctx.llm,
                                                    s.workdir / "media" / key / f"episode_{bkey}.json"))
+        series.apply_text_fixes(ing, analyses[-1])
     doc = series.assemble(ingests, analyses, job.episodes)
     if stop("episode"):
         return []

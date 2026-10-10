@@ -34,6 +34,7 @@ def main() -> None:
     r.add_argument("--duration", type=int, help="目标时长（秒）")
     r.add_argument("--count", help="每个任务出几条成片：数字或 auto")
     r.add_argument("--layout", choices=["vertical", "horizontal"])
+    r.add_argument("--workers", type=int, default=1, help="并行处理的集数")
 
     b = sub.add_parser("batch", parents=[common], help="按 jobs.yaml 批量生产")
     b.add_argument("jobs")
@@ -50,10 +51,9 @@ def main() -> None:
         presets = [p.strip() for p in a.preset.split(",")] if a.preset else None
         jobs = build_jobs(a.name, inputs, ctx.s, presets, mode=a.mode, episodes=a.episodes, genre=a.genre,
                           style=a.style, target_duration=a.duration, layout=a.layout, count=a.count)
-        workers = 1
     else:
         jobs = load_jobs(a.jobs, ctx.s)
-        workers = a.workers
+    workers = a.workers
     log.info("共 %d 个任务", len(jobs))
 
     failed = []
