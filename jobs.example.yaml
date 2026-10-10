@@ -1,0 +1,9 @@
+jobs:
+  # 三种规格一次产出：每集竖屏3分钟(short) + 每集横屏5分钟(bili) + 全剧浓缩10分钟(recap)
+  # 同一素材的识别/打分结果共享缓存，不会重复花钱
+  - name: 一乡之长
+    input: /Volumes/ExternalSSD/Data/videos/原片修复/一乡之长/合集
+    presets: [short, bili, recap]
+    genre: comedy
+    style: 东北乡土喜剧，吐槽乡长的官场小智慧，接地气
+    # episodes: 1-3        # 只做部分集

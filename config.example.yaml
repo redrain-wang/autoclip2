@@ -1,0 +1,67 @@
+workdir: work          # 中间缓存（可断点续跑）
+output_dir: output     # 成片输出
+
+# 文本大模型：剧情梳理 / 导演选段 / 写解说稿。解说质量主要取决于它，建议用最强的模型。
+# 任何 OpenAI 兼容接口均可：OpenAI、OpenRouter(可调 Claude/Gemini)、DeepSeek、通义、豆包……
+llm:
+  model: qwen-max               # 也可用 qwen-plus（更便宜）、deepseek-chat（改 base_url 和 Key）
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  temperature: 0.8
+  max_concurrency: 4
+  json_mode: true
+
+# 视觉大模型：逐段看关键帧+台词并打分。调用量最大，选便宜快速的多模态模型。
+vlm:
+  model: qwen-vl-plus            # 效果不够可换 qwen-vl-max
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  temperature: 0.3
+  max_concurrency: 8
+  json_mode: false
+
+asr:
+  backend: mlx                   # mlx(Apple Silicon 推荐) | faster-whisper | openai
+  model: mlx-community/whisper-large-v3-turbo   # faster-whisper 填 large-v3
+  language: zh
+  use_sidecar_srt: true          # 视频旁有同名 .srt 时直接使用，跳过识别
+
+tts:
+  backend: edge                  # edge(免费) | openai
+  voice: zh-CN-YunxiNeural       # 男声解说常用；女声 zh-CN-XiaoxiaoNeural
+  rate: "+12%"
+
+analysis:
+  scene_threshold: 0.3
+  beat_min: 15
+  beat_max: 50
+  frames_per_beat: 4
+  skip_head: 0                   # 跳过片头秒数
+  skip_tail: 0                   # 跳过片尾秒数
+
+render:
+  layout: vertical               # vertical(1080x1920 抖音/快手) | horizontal(1920x1080 B站)
+  font: PingFang SC
+  duck_volume: 0.12              # 解说时原声音量
+  bgm: null                      # 背景音乐文件路径
+  bgm_volume: 0.06
+  narration_ratio: 0.65
+  crf: 20
+  preset: medium
+  workers: 3
+
+# 规格预设：--preset short,bili,recap 一次出多种规格；可写任意 render 字段和 mode/target_duration/genre/style/episodes
+presets:
+  short:            # 抖音/快手：每集由导演决定出几条，竖屏 3 分钟
+    mode: per_episode
+    layout: vertical
+    target_duration: 180
+    count: auto     # 也可写固定数字；auto 时上限由 max_count 控制（默认 6）
+  bili:             # B站/西瓜：每集一条，横屏 5 分钟
+    mode: per_episode
+    layout: horizontal
+    target_duration: 300
+  recap:            # 全剧浓缩：整部一条，横屏 10 分钟
+    mode: whole
+    layout: horizontal
+    target_duration: 600
