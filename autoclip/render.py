@@ -237,9 +237,12 @@ def render(job: Job, script: dict, voices: dict[int, dict], ingests: list[dict],
         amap = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     else:
         amap = ["-map", "0:a", "-c:a", "copy"]
+    # 先写临时文件再改名，避免播放器打开渲染中的半成品
+    tmp = out.with_name(f".{out.stem}.tmp.mp4")
     cmd += ["-filter_complex", fc, "-map", "[v]", *amap, "-c:v", "libx264", "-preset", r.preset,
-            "-crf", str(r.crf), "-movflags", "+faststart", out]
+            "-crf", str(r.crf), "-movflags", "+faststart", tmp]
     run(cmd, cwd=rdir)
+    tmp.replace(out)
     if r.cover:
         make_cover(job, script, items, logo, out.with_suffix(".jpg"), r)
 
