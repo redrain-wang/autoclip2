@@ -8,10 +8,10 @@ from pathlib import Path
 
 import yaml
 
-from . import prompts
+from . import prompts, research
 from .ingest import apply_fixes
 from .llm import LLMClient
-from .utils import cached, log, slug
+from .utils import cached, log, short_hash, slug
 
 SERIES_DIR = Path("series")
 LONG_TIMEOUT = 1200.0  # 整剧/整集长上下文调用
@@ -38,13 +38,46 @@ def _compact(ing: dict) -> str:
     return " ".join(out)
 
 
+def _fingerprint(ingests: list[dict]) -> str:
+    return short_hash(sorted(Path(i["file"]).name for i in ingests))
+
+
+def _same_show(data: dict, ingests: list[dict]) -> bool:
+    """素材变了时判断是不是同一部剧：已有主要人物有一半以上出现在新台词里。"""
+    text = "".join(x["text"] for ing in ingests for x in ing["subs"])
+    names = [c.get("name", "") for c in (data.get("characters") or [])[:10] if len(c.get("name", "")) >= 2]
+    return bool(names) and sum(n in text for n in names) * 2 >= len(names)
+
+
+def _save(path: Path, data: dict) -> None:
+    if path.exists():
+        path.replace(path.with_suffix(".yaml.bak"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=200), "utf-8")
+
+
 def load_bible(name: str, ingests: list[dict], llm: LLMClient, force: bool = False) -> dict:
-    """已有 characters 的资料文件直接使用（人工修改优先）；否则用全剧台词 + notes 生成。"""
+    """剧集资料：已有且素材未变则直接用（人工修改优先）；新剧/换剧时自动检索资料 → 生成 → 用台词审校。"""
     path = bible_path(name)
     data = (yaml.safe_load(path.read_text("utf-8")) if path.exists() else None) or {}
+    fp = _fingerprint(ingests)
     if data.get("characters") and not force:
-        return data
+        if data.get("source") == fp:
+            return data
+        if data.get("source") is None or _same_show(data, ingests):
+            if data.get("source") is not None:
+                log.info("[bible] 素材有变化但仍是同一部剧，沿用剧集资料")
+            data["source"] = fp
+            _save(path, data)
+            return data
+        log.warning("[bible] 检测到换剧：%s 里的人物在新素材中基本没有出现，重新建立资料（旧文件备份为 .yaml.bak）", path)
+        data = {}
+    elif not data.get("characters"):
+        log.info("[bible] 新剧《%s》，自动建立剧集资料", name)
+
     notes = data.get("notes", "")
+    sample = "\n\n".join(_compact(ing) for ing in ingests[:2])[:20000]
+    found = research.research(name, sample, llm)
     log.info("[bible] 用 %d 集台词生成剧集资料 → %s", len(ingests), path)
     parts = [f"## 第{i}集\n{_compact(ing)}" for i, ing in enumerate(ingests, 1)]
     chunks: list[list[str]] = [[]]
@@ -52,7 +85,8 @@ def load_bible(name: str, ingests: list[dict], llm: LLMClient, force: bool = Fal
         if chunks[-1] and sum(map(len, chunks[-1])) + len(p) > BIBLE_CHARS:
             chunks.append([])
         chunks[-1].append(p)
-    head = f"作品：{name}\n\n已知资料：\n{notes or '无'}\n\n"
+    head = (f"作品：{name}\n\n已知资料（人工确认，可信度最高）：\n{notes or '无'}\n\n"
+            f"公开资料（自动检索，可信度次之，与台词冲突时以台词为准）：\n{found or '无'}\n\n")
     if len(chunks) == 1:
         r = llm.chat_json(prompts.BIBLE_SYSTEM, head + "\n\n".join(parts), temperature=0.2, timeout=LONG_TIMEOUT)
     else:
@@ -64,13 +98,51 @@ def load_bible(name: str, ingests: list[dict], llm: LLMClient, force: bool = Fal
         r = llm.chat_json(prompts.BIBLE_MERGE_SYSTEM, head + json.dumps(brief, ensure_ascii=False),
                           temperature=0.2, timeout=LONG_TIMEOUT)
         r["episodes"] = [e for s in subs for e in s.get("episodes") or []]
-    data = {"notes": notes, **{k: v for k, v in data.items() if k not in GENERATED and k != "notes"},
-            **{k: r.get(k) for k in GENERATED}}
-    if path.exists():
-        path.replace(path.with_suffix(".yaml.bak"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=200), "utf-8")
+    data = {"notes": notes, "research": found,
+            **{k: v for k, v in data.items() if k not in GENERATED and k not in ("notes", "research", "source")},
+            **{k: r.get(k) for k in GENERATED}, "source": fp}
+    _audit(data, ingests, llm)
+    _save(path, data)
     return data
+
+
+def _audit(data: dict, ingests: list[dict], llm: LLMClient) -> None:
+    """用全剧台词里检索到的证据核对人物关系和错字表，原地修正。"""
+    lines = [x["text"] for ing in ingests for x in ing["subs"]]
+
+    def evidence(words: list[str], k: int) -> list[str]:
+        hits = [i for i, t in enumerate(lines) if any(w in t for w in words)]
+        step = max(1, len(hits) // k)
+        return [" / ".join(lines[max(0, i - 1):i + 2]) for i in hits[::step][:k]]
+
+    fixes = data.get("asr_fixes") or {}
+    chars = data.get("characters") or []
+    ev = []
+    for c in chars:
+        words = [c.get("name", "")] + [a for a in c.get("aliases") or [] if a not in fixes]
+        found = evidence([w for w in words if len(w) >= 2], 6)
+        ev.append(f"### {c.get('name')}（出现 {len(found)} 处样本）\n" + ("\n".join(found) or "（台词中未出现）"))
+    for k, v in fixes.items():
+        found = evidence([k], 2)
+        ev.append(f"### 错字校正 {k}→{v}\n" + ("\n".join(found) or "（台词中未出现）"))
+    user = (f"【已知资料】\n{data.get('notes') or '无'}\n{data.get('research') or ''}\n\n"
+            f"【人物表】\n{json.dumps(chars, ensure_ascii=False)}\n\n【错字校正】\n{json.dumps(fixes, ensure_ascii=False)}\n\n"
+            "【台词证据】\n" + "\n\n".join(ev))
+    try:
+        r = llm.chat_json(prompts.BIBLE_AUDIT_SYSTEM, user, temperature=0.1, timeout=LONG_TIMEOUT)
+    except Exception as e:  # noqa: BLE001  审校失败不阻塞，保留生成结果
+        log.warning("[bible] 审校失败，保留原结果: %s", e)
+        return
+    new = [c for c in r.get("characters") or [] if isinstance(c, dict) and c.get("name")]
+    if len(new) * 2 >= len(chars):
+        data["characters"] = new
+    leads = {c.get("name") for c in chars[:5]}
+    for k in r.get("drop_fixes") or []:
+        # 主角名字的错写出现最多、最该纠正，不允许审校删掉
+        if fixes.get(k) not in leads:
+            fixes.pop(k, None)
+    for x in r.get("changes") or []:
+        log.info("[bible] 审校：%s", x)
 
 
 def name_fixes(bible: dict) -> dict[str, str]:
