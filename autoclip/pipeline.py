@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from . import director, render, series, tts
@@ -108,6 +109,8 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
         bible = series.load_bible(job.series, _ingest_all(job.series_files or job.files, s), ctx.llm,
                                   force=redo == "bible")
     series.apply_name_fixes(ingests, series.name_fixes(bible))
+    if bible.get("style") and not job.style:
+        job = replace(job, style=bible["style"])
     if stop("bible"):
         return []
 
@@ -136,7 +139,7 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
         _write_script_md(vdir / "script.md", script)
         if stop("script"):
             continue
-        voices = tts.synthesize(script, vdir / "tts", s)
+        voices = tts.synthesize(script, vdir / "tts", s, bible.get("pronounce"))
         if stop("tts"):
             continue
         name = slug(job.name) if len(videos) == 1 else f"{slug(job.name)}-{vi}"

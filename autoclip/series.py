@@ -1,6 +1,7 @@
 """剧集资料（series/<剧名>.yaml，可人工编辑）与单集梳理（场次、说话人、故事线）。"""
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -14,6 +15,8 @@ from .utils import cached, log, slug
 
 SERIES_DIR = Path("series")
 LONG_TIMEOUT = 1200.0  # 整剧/整集长上下文调用
+BIBLE_CHARS = 150_000  # 单次生成剧集资料的台词上限（约 15 集），超出则分段再合并
+GENERATED = ("intro", "synopsis", "characters", "episodes", "asr_fixes")
 
 
 def mmss(sec: float) -> str:
@@ -43,10 +46,26 @@ def load_bible(name: str, ingests: list[dict], llm: LLMClient, force: bool = Fal
         return data
     notes = data.get("notes", "")
     log.info("[bible] 用 %d 集台词生成剧集资料 → %s", len(ingests), path)
-    body = "\n\n".join(f"## 第{i}集\n{_compact(ing)}" for i, ing in enumerate(ingests, 1))
-    r = llm.chat_json(prompts.BIBLE_SYSTEM, f"作品：{name}\n\n已知资料：\n{notes or '无'}\n\n{body}",
-                      temperature=0.2, timeout=LONG_TIMEOUT)
-    data = {"notes": notes, **{k: r.get(k) for k in ("intro", "synopsis", "characters", "episodes", "asr_fixes")}}
+    parts = [f"## 第{i}集\n{_compact(ing)}" for i, ing in enumerate(ingests, 1)]
+    chunks: list[list[str]] = [[]]
+    for p in parts:
+        if chunks[-1] and sum(map(len, chunks[-1])) + len(p) > BIBLE_CHARS:
+            chunks.append([])
+        chunks[-1].append(p)
+    head = f"作品：{name}\n\n已知资料：\n{notes or '无'}\n\n"
+    if len(chunks) == 1:
+        r = llm.chat_json(prompts.BIBLE_SYSTEM, head + "\n\n".join(parts), temperature=0.2, timeout=LONG_TIMEOUT)
+    else:
+        log.info("[bible] 台词较长，分 %d 段生成后合并", len(chunks))
+        with ThreadPoolExecutor(len(chunks)) as ex:
+            subs = list(ex.map(lambda c: llm.chat_json(prompts.BIBLE_SYSTEM, head + "\n\n".join(c),
+                                                       temperature=0.2, timeout=LONG_TIMEOUT), chunks))
+        brief = [{k: s.get(k) for k in ("intro", "synopsis", "characters", "asr_fixes")} for s in subs]
+        r = llm.chat_json(prompts.BIBLE_MERGE_SYSTEM, head + json.dumps(brief, ensure_ascii=False),
+                          temperature=0.2, timeout=LONG_TIMEOUT)
+        r["episodes"] = [e for s in subs for e in s.get("episodes") or []]
+    data = {"notes": notes, **{k: v for k, v in data.items() if k not in GENERATED and k != "notes"},
+            **{k: r.get(k) for k in GENERATED}}
     if path.exists():
         path.replace(path.with_suffix(".yaml.bak"))
     path.parent.mkdir(parents=True, exist_ok=True)

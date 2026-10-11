@@ -27,12 +27,13 @@ def _openai(text: str, s: Settings, path: Path) -> None:
         r.stream_to_file(path)
 
 
-def synthesize(script: dict, out_dir: Path, s: Settings) -> dict[int, dict]:
+def synthesize(script: dict, out_dir: Path, s: Settings, pronounce: dict | None = None) -> dict[int, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
     t = s.tts
+    words = {**t.pronounce, **(pronounce or {})}
 
     def one(i: int, text: str) -> tuple[int, dict]:
-        for k, v in t.pronounce.items():
+        for k, v in words.items():
             text = text.replace(k, v)
         p, meta = out_dir / f"n{i:03d}.mp3", out_dir / f"n{i:03d}.json"
         h = short_hash([text, t.backend, t.voice, t.rate, t.pitch, t.model, t.instructions])
