@@ -48,13 +48,16 @@ class LLMClient:
                              max_retries=0 if self.fallback else 2, default_headers=headers or None)
         self._sem = threading.Semaphore(cfg.max_concurrency)
         self._down_until = 0.0  # 在此时间前直接走备用服务
+        self._fails = 0         # 连续的主服务故障次数，成功一次即清零
 
     def chat_json(self, system: str, user: str, images: list[str] | None = None,
                   temperature: float | None = None, retries: int = 3, timeout: float | None = None) -> dict:
         if self.fallback and time.time() < self._down_until:
             return self.fallback.chat_json(system, user, images, temperature, retries, timeout)
         try:
-            return self._chat_json(system, user, images, temperature, retries, timeout)
+            r = self._chat_json(system, user, images, temperature, retries, timeout)
+            self._fails = 0
+            return r
         except Exception as e:
             if not self.fallback:
                 raise
@@ -62,7 +65,10 @@ class LLMClient:
             if isinstance(cause, APIStatusError) and cause.status_code in (401, 402, 403):
                 self._down_until = float("inf")
             elif _is_outage(cause):
-                self._down_until = time.time() + self.cfg.cooldown
+                self._fails += 1
+                # 单次慢请求只让当前调用降级；连续失败才切断主服务
+                if self._fails >= 3:
+                    self._down_until = time.time() + self.cfg.cooldown
             log.warning("[%s] 切换到备用模型 %s: %s", self.cfg.model, self.fallback.cfg.model, str(e)[:120])
             return self.fallback.chat_json(system, user, images, temperature, retries, timeout)
 

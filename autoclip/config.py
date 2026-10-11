@@ -23,7 +23,7 @@ class ModelConfig:
     session_header: str | None = None  # 每个进程生成稳定会话 ID，如 OpenCode 的 x-opencode-session
     fallback: dict | None = None       # 主服务失败/额度用尽时使用的备用模型配置
     timeout: float = 240.0
-    cooldown: float = 600.0            # 主服务超时/5xx 后改走备用的秒数
+    cooldown: float = 120.0            # 主服务连续失败后改走备用的秒数
 
 
 @dataclass
