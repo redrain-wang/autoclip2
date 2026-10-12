@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def synthesize(script: dict, out_dir: Path, s: Settings, pronounce: dict | None 
         h = short_hash([text, t.backend, t.voice, t.rate, t.pitch, t.model, t.instructions])
         if p.exists() and meta.exists() and read_json(meta).get("hash") == h:
             return i, read_json(meta)
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 if t.backend == "openai":
                     _openai(text, s, p)
@@ -60,9 +61,10 @@ def synthesize(script: dict, out_dir: Path, s: Settings, pronounce: dict | None 
                     asyncio.run(_edge(text, t.voice, t.rate, t.pitch, p))
                 break
             except Exception as e:  # noqa: BLE001
-                if attempt == 2:
+                if attempt == 4:
                     raise
-                log.warning("[tts] 重试 %d: %s", i, e)
+                log.warning("[tts] 重试 %d: %s", i, str(e)[:80])
+                time.sleep(2 ** attempt * 2)
         m = {"path": str(p), "duration": duration(p), "hash": h}
         write_json(meta, m)
         return i, m
