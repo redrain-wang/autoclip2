@@ -11,9 +11,22 @@ from .utils import duration, log, read_json, short_hash, write_json
 
 
 async def _edge(text: str, voice: str, rate: str, pitch: str, path: Path) -> None:
+    import aiohttp
     import edge_tts
+    import edge_tts.communicate as ec
+    from edge_tts.constants import TRUSTED_CLIENT_TOKEN, WSS_URL
 
-    await edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(str(path))
+    # 2026-10 起旧域名对多数地区返回 403（rany2/edge-tts#490），新域名沿用旧令牌即可；上游修复后可删
+    hosts = [f"wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}", WSS_URL]
+    for i, url in enumerate(hosts):
+        ec.WSS_URL = url
+        try:
+            await edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(str(path))
+            return
+        except aiohttp.WSServerHandshakeError as e:
+            if e.status != 403 or i == len(hosts) - 1:
+                raise
+            log.warning("[tts] %s 返回 403，改用旧域名", url.split("?")[0])
 
 
 def _openai(text: str, s: Settings, path: Path) -> None:
