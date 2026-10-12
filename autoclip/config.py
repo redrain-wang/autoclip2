@@ -80,6 +80,8 @@ class RenderConfig:
     brand: str = "爱大片儿"           # 账号名，用于生成水印和封面
     watermark: str | None = "assets/brand/logo.png"  # 不存在时按 brand 自动生成；null 关闭
     watermark_opacity: float = 0.85
+    watermark_scale: float = 0.22   # 竖屏水印宽度占画面宽度比例
+    watermark_margin: int = 90      # 竖屏水印距右边缘像素；抖音右侧会被界面遮挡/裁切
     cover: bool = True                # 同时导出封面图 <成片名>.jpg
 
 

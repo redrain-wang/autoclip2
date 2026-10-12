@@ -226,11 +226,12 @@ def render(job: Job, script: dict, voices: dict[int, dict], ingests: list[dict],
     fc = "[0:v]ass=subs.ass[v]"
     if logo:
         vertical = r.layout == "vertical"
-        lw = round(W * (0.30 if vertical else 0.16) / 2) * 2
+        lw = round(W * (r.watermark_scale if vertical else 0.16) / 2) * 2
+        mx = r.watermark_margin if vertical else 30
         y = (H - fg_h) // 2 + 24 if vertical else 36
         cmd += ["-i", str(logo)]
         fc = (f"[0:v]ass=subs.ass[s];[1:v]scale={lw}:-1,format=rgba,colorchannelmixer=aa={r.watermark_opacity}[wm];"
-              f"[s][wm]overlay=W-w-30:{y}[v]")
+              f"[s][wm]overlay=W-w-{mx}:{y}[v]")
     if r.bgm:
         cmd += ["-stream_loop", "-1", "-i", str(Path(r.bgm).expanduser().resolve())]
         fc += f";[{2 if logo else 1}:a]aresample=48000,volume={r.bgm_volume}[b];[0:a][b]amix=inputs=2:duration=first:normalize=0[a]"
