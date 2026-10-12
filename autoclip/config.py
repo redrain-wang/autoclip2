@@ -22,7 +22,8 @@ class ModelConfig:
     headers: dict = field(default_factory=dict)
     session_header: str | None = None  # 每个进程生成稳定会话 ID，如 OpenCode 的 x-opencode-session
     fallback: dict | None = None       # 主服务失败/额度用尽时使用的备用模型配置
-    timeout: float = 240.0
+    timeout: float = 240.0             # 单次调用总时长上限
+    stall_timeout: float = 90.0        # 流式输出中相邻数据包的最长间隔，超过视为卡住
     cooldown: float = 120.0            # 主服务连续失败后改走备用的秒数
 
 

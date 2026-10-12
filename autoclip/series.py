@@ -14,7 +14,7 @@ from .llm import LLMClient
 from .utils import cached, log, short_hash, slug
 
 SERIES_DIR = Path("series")
-LONG_TIMEOUT = 1200.0  # 整剧/整集长上下文调用
+LONG_TIMEOUT = 600.0  # 整剧/整集长上下文调用
 BIBLE_CHARS = 150_000  # 单次生成剧集资料的台词上限（约 15 集），超出则分段再合并
 GENERATED = ("intro", "synopsis", "characters", "episodes", "asr_fixes")
 

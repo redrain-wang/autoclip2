@@ -23,13 +23,18 @@ HEARTBEAT = 60.0
 
 def _heartbeat(stop: threading.Event, tag: str, t0: float, limit: float, state: dict) -> None:
     while not stop.wait(HEARTBEAT):
-        phase = "等待并发名额" if state.get("queued") else "等待模型响应"
-        log.info("%s %s… 已 %ds / 超时 %ds", tag, phase, time.time() - t0, limit)
+        if state.get("queued"):
+            msg = "等待并发名额"
+        elif state["chars"]:
+            msg = f"正在接收，已收 {state['chars']} 字"
+        else:
+            msg = "等待首包（模型尚未开始输出）"
+        log.info("%s %s，已 %ds / 总超时 %ds", tag, msg, time.time() - t0, limit)
 
 
 def _is_outage(e: Exception) -> bool:
-    """超时/连接失败/限流/服务端错误：不值得在主服务上重试。"""
-    if isinstance(e, APIConnectionError):  # 含 APITimeoutError
+    """超时/断流/连接失败/限流/服务端错误：不值得在主服务上重试。"""
+    if isinstance(e, (APIConnectionError, TimeoutError)):  # APIConnectionError 含 APITimeoutError
         return True
     return isinstance(e, APIStatusError) and (e.status_code in (401, 402, 403, 429) or e.status_code >= 500)
 
@@ -87,17 +92,26 @@ class LLMClient:
             tag = f"[{self.cfg.model} #{next(_req_ids)}]"
             log.info("%s 发送请求（第 %d/%d 次）：输入 %d 字%s，超时 %ds", tag, attempt + 1, retries,
                      len(system) + len(user), f"、图片 {len(images)} 张" if images else "", limit)
-            t0, stop, state = time.time(), threading.Event(), {"queued": True}
+            t0, stop, state = time.time(), threading.Event(), {"queued": True, "chars": 0}
             threading.Thread(target=_heartbeat, args=(stop, tag, t0, limit, state), daemon=True).start()
             try:
                 with self._sem:
                     state["queued"] = False
-                    resp = self.client.chat.completions.create(
+                    # 流式：timeout 作为相邻数据包的最长间隔，断流即判失败；总时长另由 limit 限制
+                    stream = self.client.chat.completions.create(
                         model=self.cfg.model, messages=messages,
                         temperature=self.cfg.temperature if temperature is None else temperature,
-                        timeout=limit, **kwargs,
+                        timeout=self.cfg.stall_timeout, stream=True, **kwargs,
                     )
-                text = resp.choices[0].message.content or ""
+                    parts: list[str] = []
+                    for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            parts.append(chunk.choices[0].delta.content)
+                            state["chars"] += len(parts[-1])
+                        if time.time() - t0 > limit:
+                            stream.close()
+                            raise TimeoutError(f"总耗时超过 {limit:.0f}s")
+                text = "".join(parts)
                 log.info("%s 收到响应：%.0fs，输出 %d 字", tag, time.time() - t0, len(text))
                 data = extract_json(text)
                 if not isinstance(data, dict):
