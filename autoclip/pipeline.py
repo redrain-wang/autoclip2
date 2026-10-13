@@ -5,7 +5,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
-from . import director, render, series, tts
+from . import check, director, render, series, tts
 from .config import Job, Settings
 from .ingest import ingest
 from .llm import LLMClient
@@ -13,6 +13,7 @@ from .understand import analyze_beats
 from .utils import cached, file_key, log, short_hash, slug, write_json
 
 STAGES = ["ingest", "analyze", "bible", "episode", "plan", "script", "tts", "render"]
+SCRIPT_RETRIES = 2
 
 _guard = threading.Lock()
 _media_locks: dict[str, threading.Lock] = {}
@@ -59,7 +60,7 @@ def invalidate(job: Job, jdir: Path, s: Settings, stage: str) -> None:
         targets += [jdir / "plan.json", *jdir.glob("v*/")]
     vdirs = list(jdir.glob("v*/"))
     if idx == 5:
-        targets += [p for v in vdirs for p in (v / "script.json", v / "script.md")]
+        targets += [p for v in vdirs for p in (v / "script.json", v / "script.md", v / "quarantine.json")]
     if idx <= 6:
         targets += [v / "tts" for v in vdirs]
     targets += [v / "render" for v in vdirs]
@@ -135,7 +136,9 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
     for vi, v in enumerate(videos, 1):
         log.info("[%s] ━━ 成片 %d/%d：%s", job.name, vi, len(videos), v["title"])
         vdir = jdir / f"v{vi}"
-        script = cached(vdir / "script.json", lambda: director.write_script(job, bible, doc, v, ctx.llm, s))
+        script = _checked_script(vdir, lambda: director.write_script(job, bible, doc, v, ctx.llm, s))
+        if script is None:
+            continue
         _write_script_md(vdir / "script.md", script)
         if stop("script"):
             continue
@@ -144,7 +147,26 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
             continue
         name = slug(job.name) if len(videos) == 1 else f"{slug(job.name)}-{vi}"
         outs.append(render.render(job, script, voices, ingests, vdir / "render", s, name))
+        check.verify(outs[-1], script, job)
     return outs
+
+
+def _checked_script(vdir: Path, make) -> dict | None:
+    """解说稿有文字问题就重写，最多重写 SCRIPT_RETRIES 次；仍不通过则隔离（不配音、不渲染）。"""
+    path, qpath = vdir / "script.json", vdir / "quarantine.json"
+    if qpath.exists():
+        log.warning("[check] %s 已隔离，跳过（用 --redo script 解除）", vdir.name)
+        return None
+    for attempt in range(SCRIPT_RETRIES + 1):
+        script = cached(path, make)
+        issues = check.check_script(script)
+        if not issues:
+            return script
+        log.warning("[check] %s 解说稿不通过(%d/%d): %s", vdir.name, attempt + 1, SCRIPT_RETRIES + 1, issues)
+        if attempt < SCRIPT_RETRIES:
+            path.unlink()
+    write_json(qpath, {"issues": issues})
+    return None
 
 
 def _write_script_md(path: Path, script: dict) -> None:

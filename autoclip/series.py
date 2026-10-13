@@ -173,7 +173,8 @@ def bible_text(bible: dict, eps: list[int]) -> str:
     near = {e + d for e in eps for d in (-1, 0, 1)}
     syn = "\n".join(f"第{e.get('ep')}集：{e.get('synopsis', '')}"
                     for e in bible.get("episodes") or [] if e.get("ep") in near)
-    return f"【作品介绍】{bible.get('intro', '')}\n\n【人物】\n{chars}\n\n【前后剧集梗概】\n{syn}"
+    cast = f"【主演】{'、'.join(map(str, bible['cast']))}\n\n" if bible.get("cast") else ""
+    return f"【作品介绍】{bible.get('intro', '')}\n\n{cast}【人物】\n{chars}\n\n【前后剧集梗概】\n{syn}"
 
 
 def analyze_episode(ing: dict, beats: list[dict], bible: dict, ep: int, llm: LLMClient, path: Path) -> dict:

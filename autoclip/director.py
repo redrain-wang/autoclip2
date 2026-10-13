@@ -22,12 +22,36 @@ def _scene_block(doc: dict, sc: dict) -> str:
     return _scene_header(sc) + "\n" + "\n".join(line_text(doc, i) for i in range(sc["l0"], sc["l1"] + 1))
 
 
+def _leads(bible: dict) -> list[str]:
+    # 资料里人物按重要性排序，未单独指定 leads 时取前两位
+    return list(bible.get("leads") or [c.get("name") for c in (bible.get("characters") or [])[:2]])
+
+
+def _lead_hook(doc: dict, scenes: list[str], leads: list[str]) -> list[int] | None:
+    """在所选场戏里找主角台词最密的一段作为钩子（同数量时取精彩度高的场）。"""
+    L, by_id = doc["lines"], {sc["id"]: sc for sc in doc["scenes"]}
+    best, best_key = None, (0, 0.0)
+    for sid in scenes:
+        sc = by_id[sid]
+        for a in range(sc["l0"], sc["l1"] + 1):
+            if L[a].get("spk") not in leads:
+                continue
+            b = a
+            while b + 1 <= sc["l1"] and L[b + 1]["end"] - L[a]["start"] <= HOOK_MAX:
+                b += 1
+            n = sum(L[i].get("spk") in leads for i in range(a, b + 1))
+            if L[b]["end"] - L[a]["start"] >= 3 and (n, sc.get("fun", 0)) > best_key:
+                best, best_key = [a, b], (n, sc.get("fun", 0))
+    return best
+
+
 def make_plan(job: Job, bible: dict, doc: dict, llm: LLMClient) -> dict:
     auto = str(job.count).lower() == "auto"
+    leads = _leads(bible)
     count = job.max_count if auto else max(1, int(job.count))
     count_desc = f"若干条（由你判断素材值得做几条，最多 {job.max_count} 条）" if auto else f"恰好 {count} 条"
     lines = "\n".join(f"- {s.get('title', '')}：{'、'.join(s['scenes'])} ｜{s.get('summary', '')}" for s in doc["storylines"])
-    user = (f"{bible_text(bible, job.episodes)}\n\n【本集剧情】\n{doc['synopsis']}\n\n【故事线】\n{lines}\n\n"
+    user = (f"{bible_text(bible, job.episodes)}\n\n【主角】{'、'.join(map(str, leads))}\n\n【本集剧情】\n{doc['synopsis']}\n\n【故事线】\n{lines}\n\n"
             f"【额外要求】{job.style or '无'}\n\n【场次与台词（行首为说话人）】\n"
             + "\n\n".join(_scene_block(doc, sc) for sc in doc["scenes"]))
     system = prompts.PLAN_SYSTEM.format(duration=job.target_duration, count_desc=count_desc)
@@ -39,8 +63,11 @@ def make_plan(job: Job, bible: dict, doc: dict, llm: LLMClient) -> dict:
     for v in (r.get("videos") or [])[:count]:
         scenes = sorted({x for x in v.get("scenes") or [] if x in order}, key=order.get)
         if scenes:
+            hook = _hook_lines(doc, v.get("hook"))
+            if leads and not (hook and any(doc["lines"][i].get("spk") in leads for i in range(hook[0], hook[1] + 1))):
+                hook = _lead_hook(doc, scenes, leads) or hook
             videos.append({"title": v.get("title") or job.name, "angle": v.get("angle", ""), "scenes": scenes,
-                           "hook": _hook_lines(doc, v.get("hook"))})
+                           "hook": hook})
     if not videos:
         raise RuntimeError("策划没有返回有效的场次")
     log.info("[plan] 策划 %d 条成片: %s", len(videos), [v["title"] for v in videos])
@@ -116,6 +143,9 @@ def write_script(job: Job, bible: dict, doc: dict, video: dict, llm: LLMClient, 
     narr_chars = int(job.target_duration * r_cfg.narration_ratio * r_cfg.narration_speed)
     intro = ("这是全剧第一集，可以先用一两句话介绍这部剧（年代、题材、主角），再进入故事" if 1 in job.episodes
              else "不需要介绍这部剧，必要时用一句话交代前情")
+    if bible.get("cast"):
+        intro = (f"先用半句话点明主演和剧名，如“XX、XX主演的《{job.series or job.name}》”，演员只能从【主演】里选 1~3 位、"
+                 f"不得添加列表外的演员，再进入故事；{intro}")
     system = prompts.SCRIPT_SYSTEM.format(extra=job.style or "无", intro_hint=intro, example=prompts.STYLE_EXAMPLE,
                                           orig_pct=round((1 - r_cfg.narration_ratio) * 100), narr_chars=narr_chars)
     hook = video.get("hook")

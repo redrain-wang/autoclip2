@@ -11,6 +11,8 @@ from .config import build_jobs, load_jobs, load_settings
 from .pipeline import STAGES, Context, run_job
 from .utils import log
 
+MAX_FAIL_STREAK = 3  # 连续这么多个任务失败或无产出，视为系统性问题并停止
+
 
 def main() -> None:
     load_dotenv()
@@ -57,16 +59,26 @@ def main() -> None:
     log.info("共 %d 个任务", len(jobs))
 
     failed = []
+    streak = 0
     with ThreadPoolExecutor(max(1, workers)) as ex:
         futs = {ex.submit(run_job, j, ctx, a.redo, a.stop_after): j for j in jobs}
         for f in as_completed(futs):
+            if f.cancelled():
+                continue
             j = futs[f]
             try:
                 out = f.result()
                 log.info("✔ %s %s", j.name, "\n  ".join(map(str, out or [])))
+                streak = streak + 1 if not out and not a.stop_after else 0
             except Exception as e:  # noqa: BLE001
                 failed.append(j.name)
+                streak += 1
                 log.exception("✘ %s: %s", j.name, e)
+            if streak >= MAX_FAIL_STREAK:
+                log.error("连续 %d 个任务没有产出，停止剩余任务", streak)
+                failed.append("(熔断)")
+                for g in futs:
+                    g.cancel()
     if failed:
         log.error("失败任务: %s", failed)
         sys.exit(1)
