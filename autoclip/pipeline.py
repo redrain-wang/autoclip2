@@ -103,11 +103,6 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
             beats = [] if stop("ingest") else analyze_beats(ing, mdir, ctx.vlm)
         ingests.append(ing)
         eps.append(beats)
-    # 素材台词时间校准过的话，旧策划/稿件里存的是旧时间，作废重做
-    timing, tpath = [ing.get("timing") for ing in ingests], jdir / "timing.json"
-    if (jdir / "plan.json").exists() and (read_json(tpath) if tpath.exists() else [None] * len(timing)) != timing:
-        invalidate(job, jdir, s, "plan")
-    write_json(tpath, timing)
     if stop("analyze"):
         return []
 
@@ -129,6 +124,11 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
                                                    s.workdir / "media" / key / f"episode_{bkey}.json"))
         series.apply_text_fixes(ing, analyses[-1])
     doc = series.assemble(ingests, analyses, job.episodes)
+    # 策划/稿件存的是行号、场次和时间，台词时间、剧集资料或单集梳理变了就作废重做
+    sig, spath = [bkey, [i.get("timing") for i in ingests], [a.get("ver") for a in analyses]], jdir / "inputs.json"
+    if (jdir / "plan.json").exists() and (read_json(spath) if spath.exists() else None) != sig:
+        invalidate(job, jdir, s, "plan")
+    write_json(spath, sig)
     if stop("episode"):
         return []
 

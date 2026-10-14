@@ -11,7 +11,7 @@ import yaml
 from . import prompts, research
 from .ingest import apply_fixes
 from .llm import LLMClient
-from .utils import cached, log, short_hash, slug
+from .utils import cached, log, read_json, short_hash, slug
 
 SERIES_DIR = Path("series")
 LONG_TIMEOUT = 600.0  # 整剧/整集长上下文调用
@@ -178,23 +178,31 @@ def bible_text(bible: dict, eps: list[int]) -> str:
 
 def analyze_episode(ing: dict, beats: list[dict], bible: dict, ep: int, llm: LLMClient, path: Path) -> dict:
     subs = ing["subs"]
+    # 提示词改了就让旧缓存失效；没有版本号的旧缓存视为有效，避免已出片的集数被整体重做
+    sver = short_hash(prompts.EPISODE_SYSTEM)
+    ver = short_hash([sver, prompts.SPEAKER_SYSTEM])
+    spath = path.with_name(path.stem + "_scenes.json")
+    for p, v in ((spath, sver), (path, ver)):
+        if p.exists() and (old := read_json(p).get("ver")) and old != v:
+            p.unlink()
 
     def scenes() -> dict:
         vis = "\n".join(f"[{mmss(b['start'])}-{mmss(b['end'])}] {b['summary']}" for b in beats if not b.get("is_filler"))
         lines = "\n".join(f"L{i} [{mmss(x['start'])}] {x['text']}" for i, x in enumerate(subs))
         user = f"{bible_text(bible, [ep])}\n\n当前：第{ep}集\n\n【画面摘要】\n{vis}\n\n【台词】\n{lines}"
         log.info("[episode] 第 %d 集：梳理场次（%d 行台词）", ep, len(subs))
-        return _clean_episode(llm.chat_json(prompts.EPISODE_SYSTEM, user, temperature=0.2, timeout=LONG_TIMEOUT), ing)
+        r = _clean_episode(llm.chat_json(prompts.EPISODE_SYSTEM, user, temperature=0.2, timeout=LONG_TIMEOUT), ing)
+        return {**r, "ver": sver}
 
     def work() -> dict:
-        data = cached(path.with_name(path.stem + "_scenes.json"), scenes)
+        data = cached(spath, scenes)
         _scene_times(data["scenes"], ing)
         log.info("[episode] 第 %d 集：标注说话人（%d 场）", ep, len(data["scenes"]))
         with ThreadPoolExecutor(llm.cfg.max_concurrency) as ex:
             parts = list(ex.map(lambda k: _speakers(data["scenes"], k, subs, beats, bible, llm),
                                 range(len(data["scenes"]))))
         return {**data, "speakers": [x for p, _ in parts for x in p],
-                "fixes": {k: v for _, f in parts for k, v in f.items()}}
+                "fixes": {k: v for _, f in parts for k, v in f.items()}, "ver": ver}
     data = cached(path, work)
     _scene_times(data["scenes"], ing)
     return data
