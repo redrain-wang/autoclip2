@@ -18,30 +18,62 @@ _whisper_lock = threading.Lock()
 _whisper_model = None
 
 
-def ingest(video: Path, mdir: Path, s: Settings) -> dict:
+def ingest(video: Path, mdir: Path, s: Settings, retime_subs: bool = True) -> dict:
     mdir.mkdir(parents=True, exist_ok=True)
     out = mdir / "ingest.json"
     if out.exists():
         data = read_json(out)
+        if retime_subs and data.get("timing") != TIMING and _needs_retime(video, data, s):
+            _upgrade_timing(video, mdir, data, s)
         _simplify(data["subs"])
         return data
     log.info("[ingest] %s", video.name)
     info = media_info(video)
     wav = mdir / "audio.wav"
     if info["has_audio"] and not wav.exists():
-        run(["ffmpeg", "-y", "-v", "error", "-i", video, "-map", "0:a:0", "-vn",
-             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav])
+        _extract_wav(video, wav)
     subs = load_subtitles(video, wav if info["has_audio"] else None, mdir, s)
     _simplify(subs)
     cuts = cached(mdir / "cuts.json", lambda: detect_cuts(video, s.analysis.scene_threshold))
     energy = audio_energy(wav) if info["has_audio"] else []
     beats = build_beats(info["duration"], cuts, subs, s)
     extract_frames(video, beats, mdir / "frames", s)
-    data = {"file": str(video), **info, "subs": subs, "cuts": cuts, "energy": energy, "beats": beats}
+    data = {"file": str(video), **info, "subs": subs, "cuts": cuts, "energy": energy, "beats": beats,
+            "timing": TIMING}
     write_json(out, data)
     log.info("[ingest] %s: 时长 %.0fs, 台词 %d 条, 镜头 %d, 段落 %d",
              video.name, info["duration"], len(subs), len(cuts), len(beats))
     return data
+
+
+TIMING = "words-v1"  # 台词时间已按逐词时间校准；旧缓存没有此标记
+
+
+def _extract_wav(video: Path, wav: Path) -> None:
+    # 有些片源音频时间戳有断档，不补齐的话之后的声音都会比画面提前
+    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-map", "0:a:0", "-vn", "-af", "aresample=async=1:first_pts=0",
+         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav])
+
+
+def _needs_retime(video: Path, data: dict, s: Settings) -> bool:
+    return (data.get("has_audio") and s.asr.backend == "mlx"
+            and not (s.asr.use_sidecar_srt and find_sidecar_srt(video)))
+
+
+def _upgrade_timing(video: Path, mdir: Path, data: dict, s: Settings) -> None:
+    """旧缓存：重新提取音频并按逐词时间校准台词。文字和行数不变，场次划分和画面分析继续有效。"""
+    log.info("[asr] %s：校准台词时间（本地识别，仅此一次）", video.name)
+    wav = mdir / "audio.wav"
+    _extract_wav(video, wav)
+    data["subs"] = retime(data["subs"], _words(_mlx_transcribe(wav, s, word_timestamps=True)))
+    data["energy"] = audio_energy(wav)
+    data["timing"] = TIMING
+    write_json(mdir / "subs.json", data["subs"])
+    write_json(mdir / "ingest.json", data)
+    # 说话人标注参考了按旧时间对齐的画面，需重做；场次划分（*_scenes.json）按行号，保留
+    for p in mdir.glob("episode_*.json"):
+        if not p.stem.endswith("_scenes"):
+            p.unlink()
 
 
 # ---------------- 字幕 / ASR ----------------
@@ -140,15 +172,70 @@ def _asr_local(wav: Path, s: Settings) -> list[dict]:
 
 
 def _asr_mlx(wav: Path, s: Settings) -> list[dict]:
+    r = _mlx_transcribe(wav, s, word_timestamps=False)
+    subs = [{"start": round(x["start"], 2), "end": round(x["end"], 2), "text": x["text"].strip()}
+            for x in r["segments"] if x["text"].strip()]
+    # 整段识别的分句好，但起止时间常差几秒到十几秒；逐词识别时间准。取前者的句、后者的时间
+    return retime(subs, _words(_mlx_transcribe(wav, s, word_timestamps=True)))
+
+
+def _mlx_transcribe(wav: Path, s: Settings, word_timestamps: bool) -> dict:
     import mlx_whisper
 
     with _whisper_lock:
-        log.info("[asr] mlx-whisper 识别 %s", wav)
+        log.info("[asr] mlx-whisper 识别%s %s", "（逐词时间）" if word_timestamps else "", wav)
         prompt = "以下是普通话的句子，使用简体中文和标点。" if s.asr.language.startswith("zh") else None
-        r = mlx_whisper.transcribe(str(wav), path_or_hf_repo=s.asr.model, language=s.asr.language,
-                                   initial_prompt=prompt, condition_on_previous_text=False)
-    return [{"start": round(x["start"], 2), "end": round(x["end"], 2), "text": x["text"].strip()}
-            for x in r["segments"] if x["text"].strip()]
+        return mlx_whisper.transcribe(str(wav), path_or_hf_repo=s.asr.model, language=s.asr.language,
+                                      initial_prompt=prompt, condition_on_previous_text=False,
+                                      word_timestamps=word_timestamps)
+
+
+def _words(r: dict) -> list[dict]:
+    return [{"start": w["start"], "end": w["end"], "word": w["word"]} for x in r["segments"] for w in x.get("words") or []]
+
+
+_PUNCT = re.compile(r"[\s，。！？、；：,.!?;:…“”\"'（）()《》]")
+
+
+def retime(subs: list[dict], words: list[dict]) -> list[dict]:
+    """按逐词时间重新对齐每行台词的起止，文字和行数不变。"""
+    if not subs or not words:
+        return subs
+    from difflib import SequenceMatcher
+
+    a, owner = [], []
+    for i, x in enumerate(subs):
+        for ch in _PUNCT.sub("", x["text"]):
+            a.append(ch)
+            owner.append(i)
+    b, at = [], []
+    for w in words:
+        chars = _PUNCT.sub("", w["word"])
+        for k in range(len(chars)):
+            b.append(chars[k])
+            at.append((w["start"] + (w["end"] - w["start"]) * k / len(chars),
+                       w["start"] + (w["end"] - w["start"]) * (k + 1) / len(chars)))
+    hit: dict[int, list[tuple[float, float]]] = {}
+    for blk in SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks():
+        for k in range(blk.size):
+            hit.setdefault(owner[blk.a + k], []).append(at[blk.b + k])
+    new: list[tuple[float, float] | None] = []
+    for i, x in enumerate(subs):
+        n, h = len(_PUNCT.sub("", x["text"])), hit.get(i) or []
+        new.append((min(t[0] for t in h), max(t[1] for t in h)) if n and len(h) >= max(1, n / 2) else None)
+    # 对不上的行（多为幻听）放在前后对上的行之间，保持原时长
+    out, prev_end = [], 0.0
+    for i, x in enumerate(subs):
+        if new[i]:
+            st, en = new[i]
+        else:
+            nxt = next((t[0] for t in new[i + 1:] if t), None)
+            st = max(prev_end, x["start"]) if nxt is None else min(max(prev_end, x["start"]), nxt)
+            en = st + (x["end"] - x["start"]) if nxt is None else min(st + (x["end"] - x["start"]), nxt)
+        st = max(st, out[-1]["start"] if out else 0.0)
+        out.append({**x, "start": round(st, 2), "end": round(max(en, st + 0.2), 2)})
+        prev_end = max(prev_end, out[-1]["end"])
+    return out
 
 
 def _asr_openai(wav: Path, mdir: Path, s: Settings) -> list[dict]:

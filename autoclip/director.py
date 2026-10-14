@@ -1,6 +1,8 @@
 """阶段3：导演 —— 按故事线策划成片；阶段4：编剧 —— 写说书式解说并换算成时间轴。"""
 from __future__ import annotations
 
+import re
+
 from . import prompts
 from .config import Job, Settings, render_cfg
 from .llm import LLMClient
@@ -9,7 +11,7 @@ from .utils import log
 
 HOOK_MAX = 12.0
 ORIG_MAX = 25.0
-TURN_GAP = 0.8   # 同一人两句间隔小于此视为一口气说完，不在中间切
+TURN_GAP = 2.0   # 同一人两句间隔小于此视为一口气说完，不在中间切
 TURN_EXTRA = 8.0 # 为说完一口气允许超出上限的秒数
 
 
@@ -110,6 +112,16 @@ def original_seg(doc: dict, a: int, b: int, max_len: float = ORIG_MAX) -> dict |
             "src_end": round(en, 2), "quote": " / ".join(f"{L[i]['spk'] or '?'}：{L[i]['text']}" for i in range(a, b + 1))}
 
 
+def _seg_lines(doc: dict, o: dict) -> list[int]:
+    return [i for i, x in enumerate(doc["lines"])
+            if x["ep"] == o["ep"] and o["src_start"] <= x["start"] < o["src_end"]]
+
+
+def _clean_text(text) -> str:
+    # 模型会抄回稿子里的“【解说】”标签，配音会把它念出来
+    return re.sub(r"^(\s*【[^】]{0,4}】)+", "", str(text or "")).strip()
+
+
 def _review(bible: dict, job: Job, scene_txt: str, segs: list[dict], llm: LLMClient) -> list[dict]:
     """事实核查：对照台词删改编造、张冠李戴的解说。"""
     narr = [i for i, x in enumerate(segs) if x["type"] == "narration"]
@@ -129,7 +141,7 @@ def _review(bible: dict, job: Job, scene_txt: str, segs: list[dict], llm: LLMCli
             continue
         if i not in narr:
             continue
-        text = str(f.get("text") or "").strip()
+        text = _clean_text(f.get("text"))
         log.info("[review] #%d %s：%s → %s", i + 1, f.get("problem", ""), segs[i]["text"], text or "（删除）")
         if text:
             segs[i] = {**segs[i], "text": text}
@@ -143,9 +155,6 @@ def write_script(job: Job, bible: dict, doc: dict, video: dict, llm: LLMClient, 
     narr_chars = int(job.target_duration * r_cfg.narration_ratio * r_cfg.narration_speed)
     intro = ("这是全剧第一集，可以先用一两句话介绍这部剧（年代、题材、主角），再进入故事" if 1 in job.episodes
              else "不需要介绍这部剧，必要时用一句话交代前情")
-    if bible.get("cast"):
-        intro = (f"先用半句话点明主演和剧名，如“XX、XX主演的《{job.series or job.name}》”，演员只能从【主演】里选 1~3 位、"
-                 f"不得添加列表外的演员，再进入故事；{intro}")
     system = prompts.SCRIPT_SYSTEM.format(extra=job.style or "无", intro_hint=intro, example=prompts.STYLE_EXAMPLE,
                                           orig_pct=round((1 - r_cfg.narration_ratio) * 100), narr_chars=narr_chars)
     hook = video.get("hook")
@@ -161,17 +170,26 @@ def write_script(job: Job, bible: dict, doc: dict, video: dict, llm: LLMClient, 
     # 钩子单独标记，避免后续同场戏的画面被“防回跳”逻辑推到钩子之后
     segs = [{**x, "beat_id": "HOOK"} for x in [original_seg(doc, *hook, HOOK_MAX)] if x] if hook else []
     n = len(doc["lines"])
+    used: set[int] = set()  # 正文已放过的台词行；钩子允许在正文里再放一次，故不计入
     for seg in r.get("segments") or []:
         try:
             if seg.get("type") == "original":
-                a, b = int(seg["from"]), int(seg["to"])
-                if (o := original_seg(doc, min(a, b), max(a, b))):
+                a, b = sorted((int(seg["from"]), int(seg["to"])))
+                while a <= b and a in used:
+                    a += 1
+                while b >= a and b in used:
+                    b -= 1
+                if a <= b and not used.intersection(range(a, b + 1)) and (o := original_seg(doc, a, b)):
+                    used.update(_seg_lines(doc, o))
                     segs.append(o)
-            elif seg.get("type") == "narration" and str(seg.get("text", "")).strip():
+                else:
+                    log.info("[script] 原声 %s~%s 与已播内容重复，跳过", seg["from"], seg["to"])
+            elif seg.get("type") == "narration" and _clean_text(seg.get("text")):
                 i = min(max(int(seg["at"]), 0), n - 1)
-                x = doc["lines"][i]
-                segs.append({"type": "narration", "beat_id": _scene_of(doc, i), "ep": x["ep"],
-                             "src_start": round(max(0.0, x["start"] - 0.3), 2), "text": str(seg["text"]).strip()})
+                x, sc = doc["lines"][i], by_id.get(_scene_of(doc, i)) or {}
+                segs.append({"type": "narration", "beat_id": sc.get("id", ""), "ep": x["ep"],
+                             "src_start": round(max(0.0, x["start"] - 0.3), 2), "text": _clean_text(seg["text"]),
+                             "scene_span": [sc.get("t0", 0.0), sc.get("t1", x["end"])]})
         except (KeyError, TypeError, ValueError):
             continue
     segs = _review(bible, job, scene_txt, segs, llm)

@@ -173,8 +173,7 @@ def bible_text(bible: dict, eps: list[int]) -> str:
     near = {e + d for e in eps for d in (-1, 0, 1)}
     syn = "\n".join(f"第{e.get('ep')}集：{e.get('synopsis', '')}"
                     for e in bible.get("episodes") or [] if e.get("ep") in near)
-    cast = f"【主演】{'、'.join(map(str, bible['cast']))}\n\n" if bible.get("cast") else ""
-    return f"【作品介绍】{bible.get('intro', '')}\n\n{cast}【人物】\n{chars}\n\n【前后剧集梗概】\n{syn}"
+    return f"【作品介绍】{bible.get('intro', '')}\n\n【人物】\n{chars}\n\n【前后剧集梗概】\n{syn}"
 
 
 def analyze_episode(ing: dict, beats: list[dict], bible: dict, ep: int, llm: LLMClient, path: Path) -> dict:
@@ -189,13 +188,29 @@ def analyze_episode(ing: dict, beats: list[dict], bible: dict, ep: int, llm: LLM
 
     def work() -> dict:
         data = cached(path.with_name(path.stem + "_scenes.json"), scenes)
+        _scene_times(data["scenes"], ing)
         log.info("[episode] 第 %d 集：标注说话人（%d 场）", ep, len(data["scenes"]))
         with ThreadPoolExecutor(llm.cfg.max_concurrency) as ex:
             parts = list(ex.map(lambda k: _speakers(data["scenes"], k, subs, beats, bible, llm),
                                 range(len(data["scenes"]))))
         return {**data, "speakers": [x for p, _ in parts for x in p],
                 "fixes": {k: v for _, f in parts for k, v in f.items()}}
-    return cached(path, work)
+    data = cached(path, work)
+    _scene_times(data["scenes"], ing)
+    return data
+
+
+def _scene_times(scenes: list[dict], ing: dict) -> list[dict]:
+    """场次起止时间由行号和当前台词时间推出（台词时间校准后旧缓存里的会过时）。"""
+    subs = ing["subs"]
+    for i, sc in enumerate(scenes):
+        l0 = sc["l0"]
+        sc["t0"] = 0.0 if i == 0 else round(max(subs[l0 - 1]["end"], subs[l0]["start"] - 3.0), 2)
+        if i:
+            scenes[i - 1]["t1"] = sc["t0"]
+    if scenes:
+        scenes[-1]["t1"] = ing["duration"]
+    return scenes
 
 
 def _speakers(scenes: list[dict], k: int, subs: list[dict], beats: list[dict], bible: dict,
@@ -261,12 +276,9 @@ def _clean_episode(r: dict, ing: dict) -> dict:
     for i, sc in enumerate(scenes):
         nxt = scenes[i + 1]["start"] if i + 1 < len(scenes) else n
         l0, l1 = sc["start"], nxt - 1
-        t0 = 0.0 if i == 0 else max(subs[l0 - 1]["end"], subs[l0]["start"] - 3.0)
         remap[str(sc.get("id"))] = f"S{i + 1:02d}"
-        sc.update(id=f"S{i + 1:02d}", l0=l0, l1=l1, t0=round(t0, 2), fun=_num(sc.get("fun")))
-        if i:
-            scenes[i - 1]["t1"] = sc["t0"]
-    scenes[-1]["t1"] = ing["duration"]
+        sc.update(id=f"S{i + 1:02d}", l0=l0, l1=l1, fun=_num(sc.get("fun")))
+    _scene_times(scenes, ing)
     return {"synopsis": r.get("synopsis", ""), "scenes": scenes,
             "storylines": [{**s, "scenes": [remap.get(x, x) for x in s.get("scenes") or []]}
                            for s in r.get("storylines") or []]}

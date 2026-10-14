@@ -49,6 +49,9 @@ def build_timeline(script: dict, voices: dict[int, dict], ingests: list[dict],
             if prev and prev["beat_id"] == seg["beat_id"] and st < prev["src_end"] - 0.5:
                 st = prev["src_end"]
             st = max(0.0, min(st, ing["duration"] - dur - 0.1))
+            if span := seg.get("scene_span"):
+                # 解说画面不跑出本场戏（否则会插进别的场景）
+                st = max(span[0], min(st, span[1] - dur))
             if blacks:
                 st = _skip_black(st, dur, blacks[seg["ep"]], ing["duration"] - 0.1)
             item.update(audio=v["path"], audio_hash=v["hash"], tts_dur=v["duration"], text=seg["text"])
@@ -75,7 +78,7 @@ def _video_chain(r: RenderConfig, W: int, H: int) -> str:
 
 def render_segment(item: dict, out: Path, r: RenderConfig, W: int, H: int) -> None:
     cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{item['src_start']:.3f}", "-t", f"{item['dur']:.3f}", "-i", item["file"]]
-    fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+    fmt = "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo"
     orig = f"[0:a:0]{fmt}" if item["has_audio"] else f"anullsrc=r=48000:cl=stereo,atrim=duration={item['dur']:.3f}"
     norm = "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"
     fc = _video_chain(r, W, H) + ";"

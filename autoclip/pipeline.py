@@ -10,7 +10,7 @@ from .config import Job, Settings
 from .ingest import ingest
 from .llm import LLMClient
 from .understand import analyze_beats
-from .utils import cached, file_key, log, short_hash, slug, write_json
+from .utils import cached, file_key, log, read_json, short_hash, slug, write_json
 
 STAGES = ["ingest", "analyze", "bible", "episode", "plan", "script", "tts", "render"]
 SCRIPT_RETRIES = 2
@@ -77,7 +77,7 @@ def _ingest_all(files: list[Path], s: Settings) -> list[dict]:
     for f in files:
         key = file_key(f)
         with _media_lock(key):
-            out.append(ingest(f, s.workdir / "media" / key, s))
+            out.append(ingest(f, s.workdir / "media" / key, s, retime_subs=False))  # 剧集资料只用台词文字
     return out
 
 
@@ -103,6 +103,11 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
             beats = [] if stop("ingest") else analyze_beats(ing, mdir, ctx.vlm)
         ingests.append(ing)
         eps.append(beats)
+    # 素材台词时间校准过的话，旧策划/稿件里存的是旧时间，作废重做
+    timing, tpath = [ing.get("timing") for ing in ingests], jdir / "timing.json"
+    if (jdir / "plan.json").exists() and (read_json(tpath) if tpath.exists() else [None] * len(timing)) != timing:
+        invalidate(job, jdir, s, "plan")
+    write_json(tpath, timing)
     if stop("analyze"):
         return []
 

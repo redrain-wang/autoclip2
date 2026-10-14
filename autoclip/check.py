@@ -7,7 +7,7 @@ from pathlib import Path
 from .config import Job
 from .utils import log, media_info, read_json, run, write_json
 
-BAD_WORDS = re.compile(r"钩子|这条视频|开头那句|片头|点赞|关注我|订阅")
+BAD_WORDS = re.compile(r"钩子|这条视频|开头那句|片头|点赞|关注我|订阅|主演|【")
 MIN_RATIO, MAX_RATIO = 0.4, 1.6  # 相对目标时长
 MIN_DB = -45.0  # 平均音量低于此值视为几乎无声
 
@@ -24,6 +24,11 @@ def check_script(script: dict) -> list[str]:
               if seg["type"] == "narration" and (m := BAD_WORDS.search(seg["text"]))]
     if not str(script.get("title") or "").strip():
         issues.append("标题为空")
+    orig = sorted((s.get("ep"), s["src_start"], s["src_end"]) for s in script["segments"]
+                  if s["type"] == "original" and s.get("beat_id") != "HOOK")
+    for (e1, a1, b1), (e2, a2, b2) in zip(orig, orig[1:]):
+        if e1 == e2 and a2 < b1 - 1.0:  # 容忍 1 秒内的边界误差
+            issues.append(f"原声重复播放：{a1:.0f}-{b1:.0f}s 与 {a2:.0f}-{b2:.0f}s 重叠")
     return issues
 
 
