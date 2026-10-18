@@ -48,6 +48,7 @@ tts:
   voice: zh-CN-YunjianNeural     # 试听样本见 work/voice_test/；其他：zh-CN-YunxiNeural / zh-CN-YunyangNeural
   rate: "+20%"
   pitch: "+0Hz"
+  max_concurrency: 2             # edge 的 WebSocket 并发一高就返回 429；调大反而更容易整集失败
   pronounce:                     # 只替换配音文本，纠正多音字；字幕仍显示原文
     乡长: 乡掌
     县长: 县掌

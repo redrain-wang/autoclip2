@@ -48,7 +48,7 @@ class TTSConfig:
     instructions: str = ""
     base_url: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
-    max_concurrency: int = 4
+    max_concurrency: int = 2   # edge 的 WebSocket 并发一高就吃 429，2 路实测最稳
     pronounce: dict = field(default_factory=dict)  # 仅用于配音的替换，纠正多音字（字幕不变）
 
 

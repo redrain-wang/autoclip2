@@ -1,6 +1,7 @@
 """阶段6：剪辑合成 —— 逐段渲染（解说段压低原声叠配音），拼接，烧录字幕/标题，混 BGM。"""
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +37,7 @@ def _skip_black(st: float, dur: float, black: list[list[float]], limit: float) -
 
 
 def build_timeline(script: dict, voices: dict[int, dict], ingests: list[dict],
-                   blacks: list[list[list[float]]] | None = None) -> list[dict]:
+                   blacks: list[list[list[float]]] | None = None, fps: int = 30) -> list[dict]:
     items, t, prev = [], 0.0, None
     for i, seg in enumerate(script["segments"]):
         ing = ingests[seg["ep"]]
@@ -58,7 +59,14 @@ def build_timeline(script: dict, voices: dict[int, dict], ingests: list[dict],
         else:
             dur = seg["src_end"] - st
             item["subs"] = subs_in(ing["subs"], st, st + dur)
-        item.update(src_start=round(st, 3), dur=round(dur, 3), src_end=round(st + dur, 3), offset=round(t, 3))
+        # 时长对齐到整帧：每段编码后会被补齐到帧边界，几十段累加就是半秒的画面漂移；
+        # 先取整帧，段边界才精确，字幕时间轴（offset）也才和实际画面一致
+        frames = math.floor((dur - 1e-6) * fps)
+        if frames <= 0:
+            continue
+        dur = frames / fps
+        item.update(src_start=round(st, 3), dur=round(dur, 6), src_end=round(st + dur, 6),
+                    offset=round(t, 6), frames=frames)
         t += dur
         prev = item
         items.append(item)
@@ -199,7 +207,7 @@ def render(job: Job, script: dict, voices: dict[int, dict], ingests: list[dict],
     fg_h = min(H, round(W * src_h / src_w / 2) * 2)
     items = build_timeline(script, voices, ingests,
                            [black_ranges(i["file"], s.workdir / "media" / file_key(Path(i["file"])) / "black.json")
-                            for i in ingests])
+                            for i in ingests], r.fps)
 
     seg_files = []
     for i, it in enumerate(items):
@@ -218,33 +226,48 @@ def render(job: Job, script: dict, voices: dict[int, dict], ingests: list[dict],
     with ThreadPoolExecutor(r.workers) as ex:
         list(ex.map(work, todo))
 
-    (rdir / "concat.txt").write_text("".join(f"file '{f.name}'\n" for f in seg_files), "utf-8")
-    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", "concat.txt", "-c", "copy", "joined.mp4"], cwd=rdir)
     (rdir / "subs.ass").write_text(build_ass(items, script.get("title", ""), W, H, fg_h, r), "utf-8")
 
     s.output_dir.mkdir(parents=True, exist_ok=True)
     out = s.output_dir / f"{out_name}.mp4"
     logo = brand.ensure_logo(r.watermark, r.brand, r.font) if r.watermark else None
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", "joined.mp4"]
-    fc = "[0:v]ass=subs.ass[v]"
+
+    # 拼接不再走 concat 解复用器 + -c copy：那样每段容器时长会被音视频帧对齐补齐（实测
+    # 12~33ms/段），二十多段累计 0.2~0.5 秒，画面越走越慢而字幕按名义时间显示，看着就是"音画不同步"。
+    # 这里在一条 filter 链里逐段裁到整帧、音频补/裁到与视频等长，再 concat，边界由视频决定。
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    parts: list[str] = []
+    n_in = len(items)
+    for i, it in enumerate(items):
+        cmd += ["-i", seg_files[i].name]
+        n, d = it["frames"], it["dur"]
+        parts.append(f"[{i}:v]setpts=PTS-STARTPTS,trim=end_frame={n},setpts=PTS-STARTPTS[s{i}v];"
+                     f"[{i}:a]asetpts=PTS-STARTPTS,apad=pad_dur=1,atrim=duration={d:.6f},"
+                     f"asetpts=PTS-STARTPTS[s{i}a]")
+    parts.append("".join(f"[s{i}v][s{i}a]" for i in range(n_in)) + f"concat=n={n_in}:v=1:a=1[vc][ac]")
     if logo:
         vertical = r.layout == "vertical"
         lw = round(W * (r.watermark_scale if vertical else 0.16) / 2) * 2
         mx = r.watermark_margin if vertical else 30
         y = (H - fg_h) // 2 + 24 if vertical else 36
         cmd += ["-i", str(logo)]
-        fc = (f"[0:v]ass=subs.ass[s];[1:v]scale={lw}:-1,format=rgba,colorchannelmixer=aa={r.watermark_opacity}[wm];"
-              f"[s][wm]overlay=W-w-{mx}:{y}[v]")
+        parts.append(f"[{n_in}:v]scale={lw}:-1,format=rgba,colorchannelmixer=aa={r.watermark_opacity}[wm];"
+                     f"[vc]ass=subs.ass[s];[s][wm]overlay=W-w-{mx}:{y}[v]")
+        n_in += 1
+    else:
+        parts.append("[vc]ass=subs.ass[v]")
     if r.bgm:
         cmd += ["-stream_loop", "-1", "-i", str(Path(r.bgm).expanduser().resolve())]
-        fc += f";[{2 if logo else 1}:a]aresample=48000,volume={r.bgm_volume}[b];[0:a][b]amix=inputs=2:duration=first:normalize=0[a]"
-        amap = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+        parts.append(f"[{n_in}:a]aresample=48000,volume={r.bgm_volume}[b];"
+                     f"[ac][b]amix=inputs=2:duration=first:normalize=0[a]")
+        amap = ["-map", "[a]"]
     else:
-        amap = ["-map", "0:a", "-c:a", "copy"]
+        amap = ["-map", "[ac]"]
     # 先写临时文件再改名，避免播放器打开渲染中的半成品
     tmp = out.with_name(f".{out.stem}.tmp.mp4")
-    cmd += ["-filter_complex", fc, "-map", "[v]", *amap, "-c:v", "libx264", "-preset", r.preset,
-            "-crf", str(r.crf), "-movflags", "+faststart", tmp]
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[v]", *amap, "-c:v", "libx264",
+            "-preset", r.preset, "-crf", str(r.crf), "-r", str(r.fps), "-c:a", "aac", "-b:a", "192k",
+            "-ar", "48000", "-movflags", "+faststart", tmp]
     run(cmd, cwd=rdir)
     tmp.replace(out)
     if r.cover:
