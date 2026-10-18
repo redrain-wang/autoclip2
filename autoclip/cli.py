@@ -68,8 +68,8 @@ def main() -> None:
             j = futs[f]
             try:
                 out = f.result()
-                log.info("✔ %s %s", j.name, "\n  ".join(map(str, out or [])))
-                streak = streak + 1 if not out and not a.stop_after else 0
+                log.info("✔ %s %s", j.name, "\n  ".join(map(str, out)) if out else "(本集无产出)")
+                streak = 0
             except Exception as e:  # noqa: BLE001
                 failed.append(j.name)
                 streak += 1

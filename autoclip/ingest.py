@@ -181,11 +181,16 @@ def _asr_mlx(wav: Path, s: Settings) -> list[dict]:
 
 def _mlx_transcribe(wav: Path, s: Settings, word_timestamps: bool) -> dict:
     import mlx_whisper
+    from huggingface_hub import snapshot_download
 
     with _whisper_lock:
+        try:
+            model_path = snapshot_download(s.asr.model, local_files_only=True)
+        except Exception:  # noqa: BLE001
+            model_path = s.asr.model
         log.info("[asr] mlx-whisper 识别%s %s", "（逐词时间）" if word_timestamps else "", wav)
         prompt = "以下是普通话的句子，使用简体中文和标点。" if s.asr.language.startswith("zh") else None
-        return mlx_whisper.transcribe(str(wav), path_or_hf_repo=s.asr.model, language=s.asr.language,
+        return mlx_whisper.transcribe(str(wav), path_or_hf_repo=model_path, language=s.asr.language,
                                       initial_prompt=prompt, condition_on_previous_text=False,
                                       word_timestamps=word_timestamps)
 

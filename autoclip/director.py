@@ -51,7 +51,7 @@ def make_plan(job: Job, bible: dict, doc: dict, llm: LLMClient) -> dict:
     auto = str(job.count).lower() == "auto"
     leads = _leads(bible)
     count = job.max_count if auto else max(1, int(job.count))
-    count_desc = f"若干条（由你判断素材值得做几条，最多 {job.max_count} 条）" if auto else f"恰好 {count} 条"
+    count_desc = f"0~{job.max_count} 条（由你按本集实际看点决定，精彩故事线不漏掉，平淡集可为 0 条）" if auto else f"恰好 {count} 条"
     lines = "\n".join(f"- {s.get('title', '')}：{'、'.join(s['scenes'])} ｜{s.get('summary', '')}" for s in doc["storylines"])
     user = (f"{bible_text(bible, job.episodes)}\n\n【主角】{'、'.join(map(str, leads))}\n\n【本集剧情】\n{doc['synopsis']}\n\n【故事线】\n{lines}\n\n"
             f"【额外要求】{job.style or '无'}\n\n【场次与台词（行首为说话人）】\n"
@@ -71,6 +71,9 @@ def make_plan(job: Job, bible: dict, doc: dict, llm: LLMClient) -> dict:
             videos.append({"title": v.get("title") or job.name, "angle": v.get("angle", ""), "scenes": scenes,
                            "hook": hook})
     if not videos:
+        if auto:
+            log.info("[plan] 本集无足够看点，策划 0 条成片")
+            return {"videos": []}
         raise RuntimeError("策划没有返回有效的场次")
     log.info("[plan] 策划 %d 条成片: %s", len(videos), [v["title"] for v in videos])
     return {"videos": videos}
@@ -118,14 +121,15 @@ def _seg_lines(doc: dict, o: dict) -> list[int]:
 
 
 def _clean_text(text) -> str:
-    # 模型会抄回稿子里的“【解说】”标签，配音会把它念出来
-    return re.sub(r"^(\s*【[^】]{0,4}】)+", "", str(text or "")).strip()
+    # 模型会抄回稿子里的“【解说】”或场次标签，配音会把它念出来
+    return re.sub(r"^(\s*(?:【[^】]{0,6}】|\[[A-Z0-9-]{2,8}\]))+", "", str(text or "")).strip()
 
 
 def _review(bible: dict, job: Job, scene_txt: str, segs: list[dict], llm: LLMClient) -> list[dict]:
     """事实核查：对照台词删改编造、张冠李戴的解说。"""
     narr = [i for i, x in enumerate(segs) if x["type"] == "narration"]
-    draft = "\n".join(f"{n}. " + (f"【解说】{x['text']}" if x["type"] == "narration" else f"【原声】{x['quote']}")
+    draft = "\n".join(f"{n}. " + (f"[{x.get('beat_id', '')}] 【解说】{x['text']}" if x["type"] == "narration"
+                                  else f"【原声】{x['quote']}")
                       for n, x in enumerate(segs, 1))
     user = f"{bible_text(bible, job.episodes)}\n\n【场次与台词】\n{scene_txt}\n\n【解说稿】\n{draft}"
     try:

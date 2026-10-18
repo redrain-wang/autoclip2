@@ -125,7 +125,8 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
         series.apply_text_fixes(ing, analyses[-1])
     doc = series.assemble(ingests, analyses, job.episodes)
     # 策划/稿件存的是行号、场次和时间，台词时间、剧集资料或单集梳理变了就作废重做
-    sig, spath = [bkey, [i.get("timing") for i in ingests], [a.get("ver") for a in analyses]], jdir / "inputs.json"
+    sig, spath = [bkey, [i.get("timing") for i in ingests], [a.get("ver") for a in analyses],
+                  [a.get("vp_ver") for a in analyses]], jdir / "inputs.json"
     if (jdir / "plan.json").exists() and (read_json(spath) if spath.exists() else None) != sig:
         invalidate(job, jdir, s, "plan")
     write_json(spath, sig)
@@ -133,7 +134,7 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
         return []
 
     plan = cached(jdir / "plan.json", lambda: director.make_plan(job, bible, doc, ctx.llm))
-    if stop("plan"):
+    if stop("plan") or not plan.get("videos"):
         return []
 
     outs = []
@@ -153,6 +154,8 @@ def run_job(job: Job, ctx: Context, redo: str | None = None, stop_after: str | N
         name = slug(job.name) if len(videos) == 1 else f"{slug(job.name)}-{vi}"
         outs.append(render.render(job, script, voices, ingests, vdir / "render", s, name))
         check.verify(outs[-1], script, job)
+    if not outs and videos and not stop_after:
+        raise RuntimeError(f"{job.name} 所有成片解说稿均未通过检验")
     return outs
 
 

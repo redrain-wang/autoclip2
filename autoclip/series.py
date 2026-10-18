@@ -8,10 +8,10 @@ from pathlib import Path
 
 import yaml
 
-from . import prompts, research
+from . import prompts, research, voiceprint
 from .ingest import apply_fixes
 from .llm import LLMClient
-from .utils import cached, log, read_json, short_hash, slug
+from .utils import cached, log, read_json, short_hash, slug, write_json
 
 SERIES_DIR = Path("series")
 LONG_TIMEOUT = 600.0  # 整剧/整集长上下文调用
@@ -205,6 +205,12 @@ def analyze_episode(ing: dict, beats: list[dict], bible: dict, ep: int, llm: LLM
                 "fixes": {k: v for _, f in parts for k, v in f.items()}, "ver": ver}
     data = cached(path, work)
     _scene_times(data["scenes"], ing)
+    if data.get("vp_ver") != voiceprint.VP_VER:
+        apply_text_fixes(ing, data)
+        bank = path.parent.parent / f"voices_{path.stem.split('_')[-1]}.json"
+        voiceprint.verify_episode(ing, data, bible, path.parent, bank)
+        data["vp_ver"] = voiceprint.VP_VER
+        write_json(path, data)
     return data
 
 
